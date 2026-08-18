@@ -1,0 +1,10 @@
+name: astrbot_plugin_interrupt_segmented_reply
+display_name: 分段回复可打断
+desc: 复刻 AstrBot 原生分段回复，支持用户插话打断、符号过滤、空括号过滤、AI感知打断
+version: v4.0.0
+author: 你的名字（改成你的 GitHub 用户名）
+repo: https://github.com/你的用户名/astrbot_plugin_interrupt_segmented_reply
+astrbot_version: ">=4.16,<5"
+tags:
+  - 分段回复
+  - 打断

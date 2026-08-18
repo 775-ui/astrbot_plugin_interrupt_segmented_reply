@@ -1,0 +1,20 @@
+{
+  "enabled": { "description": "是否启用本插件", "type": "bool", "default": true },
+  "only_llm_result": { "description": "仅对 LLM 生成的回复进行分段", "type": "bool", "default": true },
+  "words_count_threshold": { "description": "回复字数超过此值时不分段、直接整条发送", "type": "int", "default": 150 },
+  "split_mode": { "description": "分段模式：regex=正则切分，words=分段词列表切分", "type": "string", "default": "words", "options": ["regex", "words"] },
+  "regex": { "description": "分段正则（regex 模式使用），句末符号会保留", "type": "string", "default": ".*?[。？！~…]+|.+$" },
+  "split_words": { "description": "分段词列表（words 模式使用，英文逗号分隔），句末符号会保留", "type": "string", "default": "。,？,！,~,…" },
+  "content_cleanup_rule": { "description": "自定义符号过滤正则：匹配到的内容会从每段中删除，留空不过滤", "type": "string", "default": "" },
+  "remove_empty_brackets": { "description": "是否自动过滤无内容的空括号对（如《》[]『』［］）", "type": "bool", "default": true },
+  "empty_brackets": { "description": "空括号对列表，逗号分隔，每对两个字符", "type": "string", "default": "《》,[],『』,［］,（）,【】,「」" },
+  "interval_method": { "description": "分段间隔方法：random 或 log", "type": "string", "default": "random", "options": ["random", "log"] },
+  "interval": { "description": "random 模式的间隔范围，格式：最小,最大（秒）", "type": "string", "default": "3.5,4.5" },
+  "log_base": { "description": "log 模式的对数基底", "type": "float", "default": 2.6 },
+  "interrupt_enabled": { "description": "是否启用用户新消息打断分段回复", "type": "bool", "default": true },
+  "interrupt_scope": { "description": "打断范围：session=同会话任何人；sender=仅被回复的用户", "type": "string", "default": "session", "options": ["session", "sender"] },
+  "notify_interrupted": { "description": "打断时是否发送提示（同一轮只提示一次）", "type": "bool", "default": true },
+  "interrupt_notice": { "description": "打断提示文案", "type": "string", "default": "已打断～" },
+  "notify_model": { "description": "打断后是否向 AI 上下文注入打断标记（让 AI 知道自己没说完）", "type": "bool", "default": true },
+  "interrupt_model_mark": { "description": "注入上下文的打断标记文案", "type": "string", "default": "（此条回复被用户打断了，未能完整发送。被打断的部分仍完整保存在上下文中，如需继续请以此为据。）" }
+}
