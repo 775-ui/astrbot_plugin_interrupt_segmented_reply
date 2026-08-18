@@ -5,4 +5,8 @@ version: v4.0.0
 author: 775-ui
 repo: https://github.com/775-ui/astrbot_plugin_interrupt_segmented_reply
 astrbot_version: ">=4.16,<5"
-tags:AI增强
+support_platforms:                        
+#   - aiocqhttp
+#   - qq_official
+tags:                                      # （可选）标签列表，用于插件市场分类和搜索
+  # - AI增强
