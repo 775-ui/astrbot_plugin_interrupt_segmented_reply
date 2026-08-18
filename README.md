@@ -1,6 +1,6 @@
 # astrbot_plugin_stoprushingiamtyping
 
-# 更好的分段与实时打断
+# 更好的智能分段与实时打断（words模式专项优化）
 
 > **复刻并改进 AstrBot 原生分段回复优化已知问题 · 支持用户插话打断 · 智能符号处理 · AI 感知打断，本插件在AI指导中创作**
 
