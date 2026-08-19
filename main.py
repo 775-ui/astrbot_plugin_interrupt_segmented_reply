@@ -182,7 +182,7 @@ class InterruptSegmentedReplyPlugin(Star):
         return res if res else [text]
 
     def split_words(self, text, words):
-        OPENERS = set("([{“「『【《〈＜‘‹")
+        OPENERS = set("([{“「『【《〈＜‘‹（〔〖［｛")
         if not words:
             return [text]
         pat = re.compile("|".join(re.escape(w) for w in sorted(words, key=len, reverse=True)))
@@ -199,10 +199,12 @@ class InterruptSegmentedReplyPlugin(Star):
                 continue
             end = m.end()
             while end < n:
-                ch = text[end]
-                if ch.isalnum() or ('\u4e00' <= ch <= '\u9fff'):
-                    break
-                end += 1
+    ch = text[end]
+    if ch.isalnum() or ('\u4e00' <= ch <= '\u9fff'):
+        break
+    if ch in OPENERS:
+        break
+    end += 1
             if end > last:
                 parts.append(text[last:end])
             last = end
