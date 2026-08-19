@@ -1,6 +1,6 @@
 name: astrbot_plugin_interrupt_segmented_reply
-display_name: 分段回复可打断
-desc: 复刻 AstrBot 原生分段回复，支持用户插话打断、符号过滤、空括号过滤、AI感知打断
+display_name: 更好的分段与实时打断
+desc: 复刻优化 AstrBot 原生分段回复，支持用户插话打断、符号过滤、空括号过滤、AI感知打断
 version: v4.1.5
 author: 775-ui
 repo: https://github.com/775-ui/astrbot_plugin_interrupt_segmented_reply
@@ -9,4 +9,4 @@ support_platforms:                         # （可选）支持的平台适配�
 - aiocqhttp
 - qq_official
 tags:                                      # （可选）标签列表，用于插件市场分类和搜索
-  # - AI增强
+ - AI增强
