@@ -199,7 +199,7 @@ class InterruptSegmentedReplyPlugin(Star):
                 continue
             end = m.end()
             while end < n:
-    ch = text[end]
+                ch = text[end]
     if ch.isalnum() or ('\u4e00' <= ch <= '\u9fff'):
         break
     if ch in OPENERS:
