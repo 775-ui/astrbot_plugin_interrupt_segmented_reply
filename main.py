@@ -200,11 +200,11 @@ class InterruptSegmentedReplyPlugin(Star):
             end = m.end()
             while end < n:
                 ch = text[end]
-    if ch.isalnum() or ('\u4e00' <= ch <= '\u9fff'):
-        break
-    if ch in OPENERS:
-        break
-    end += 1
+                if ch.isalnum() or ('\u4e00' <= ch <= '\u9fff'):
+                    break
+                if ch in OPENERS:
+                    break
+                end += 1
             if end > last:
                 parts.append(text[last:end])
             last = end
