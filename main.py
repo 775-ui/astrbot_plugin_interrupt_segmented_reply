@@ -8,7 +8,8 @@ from astrbot.api.message_components import At, Plain, Reply
 from astrbot.api.star import Context, Star
 
 _PENDING = "interrupt_segmented_pending_id"
-_REGEX = r".*?[。？！~…]+|.+$"
+_REGEX = r'.*?[。？！~…]+["”’」』】》〉＞›）］｝〕〗〙]*|.+$'
+_CLOSERS = set('"”’」』】》〉＞›）］｝〕〗〙')
 
 class InterruptSegmentedReplyPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None) -> None:
@@ -179,6 +180,14 @@ class InterruptSegmentedReplyPlugin(Star):
             res = re.findall(regex, text, re.DOTALL | re.MULTILINE)
         except Exception:
             res = re.findall(_REGEX, text, re.DOTALL | re.MULTILINE)
+        if res:
+            merged = []
+            for seg in res:
+                if merged and seg.strip() and all(c in _CLOSERS for c in seg.strip()):
+                    merged[-1] += seg
+                else:
+                    merged.append(seg)
+            res = merged
         return res if res else [text]
 
     def split_words(self, text, words):
@@ -203,6 +212,8 @@ class InterruptSegmentedReplyPlugin(Star):
                 if ch.isalnum() or ('\u4e00' <= ch <= '\u9fff'):
                     break
                 if ch in OPENERS:
+                    break
+                if ch in _CLOSERS and text[end - 1] in '\n\r ':
                     break
                 end += 1
             if end > last:
