@@ -115,17 +115,20 @@ class InterruptSegmentedReplyPlugin(Star):
         if self.get("notify_interrupted", True):
             notice = str(self.get("interrupt_notice", "已打断～"))
             sent = False
+            # 优先用 context.send_message 发送提示（纯发送，不影响本条消息继续进入 LLM 流程）
             try:
-                await event.send(MessageChain([Plain(notice)]))
+                await self.context.send_message(session, MessageChain([Plain(notice)]))
                 sent = True
             except Exception as e:
-                logger.debug("通过 event.send 发送打断提示失败: %s", e)
+                logger.debug("通过 context.send_message 发送打断提示失败: %s", e)
             if not sent:
                 try:
-                    await self.context.send_message(session, MessageChain([Plain(notice)]))
+                    await event.send(MessageChain([Plain(notice)]))
+                    sent = True
                 except Exception as e:
-                    logger.debug("通过 context.send_message 发送打断提示失败: %s", e)
-            logger.info("打断提示已发送: %s", notice)
+                    logger.debug("通过 event.send 发送打断提示失败: %s", e)
+            logger.info("打断提示已发送: %s (方式=%s)", notice, "context" if sent else "failed")
+        logger.debug("打断处理完成，本条用户消息继续交给后续流程 (session=%s)", session)
 
     async def send_rest(self, session, sender, comps):
         truncated = False
@@ -143,7 +146,11 @@ class InterruptSegmentedReplyPlugin(Star):
                 if session in self.interrupted:
                     truncated = True
                     break
-                ok = await self.context.send_message(session, MessageChain([comp]))
+                try:
+                    ok = await self.context.send_message(session, MessageChain([comp]))
+                except Exception as e:
+                    logger.warning("context.send_message 发送失败: %s", e)
+                    ok = False
                 sent_count += 1
                 logger.info("已发送第%d/%d段 (session=%s)", sent_count, total, session)
                 if not ok:
@@ -162,59 +169,105 @@ class InterruptSegmentedReplyPlugin(Star):
     async def inject_interrupt(self, session) -> bool:
         base = str(self.get("interrupt_model_mark", "（此条回复被用户打断了，未能完整发送。被打断的部分仍完整保存在上下文中，如需继续请以此为据。）"))
         try:
-            # 1) 旧版 API：Context.get_conversation
-            try:
-                conv = self.context.get_conversation(session)
-                if conv is not None:
-                    if await self._inject_marker(conv, base):
-                        return True
-            except Exception as e:
-                logger.debug("Context.get_conversation 不可用: %s", e)
-            # 2) v4：bot.session_manager / bot.conversation_manager / context.session_manager 等
-            bot = getattr(self.context, "bot", None)
-            mgr = None
+            candidates = []
+            # 1) context 直接方法
+            for name in ("get_conversation", "get_session", "get_conversation_manager", "get_session_manager"):
+                fn = getattr(self.context, name, None)
+                if not callable(fn):
+                    continue
+                try:
+                    obj = fn(session)
+                    if asyncio.iscoroutine(obj):
+                        obj = await obj
+                    if obj is not None:
+                        candidates.append(obj)
+                except Exception as e:
+                    logger.debug("context.%s 失败: %s", name, e)
+            # 2) bot / astrbot 对象上的各类管理器
+            bot = getattr(self.context, "bot", None) or getattr(self.context, "astrbot", None)
             if bot is not None:
-                mgr = getattr(bot, "session_manager", None) or getattr(bot, "conversation_manager", None)
-            if mgr is None:
-                mgr = getattr(self.context, "session_manager", None) or getattr(self.context, "conversation_manager", None)
-            if mgr is not None:
-                for getter in ("get_session", "get_conversation"):
-                    fn = getattr(mgr, getter, None)
+                for mgr_name in ("session_manager", "conversation_manager", "message_manager"):
+                    mgr = getattr(bot, mgr_name, None)
+                    if mgr is None:
+                        continue
+                    for getter in ("get_session", "get_conversation"):
+                        fn = getattr(mgr, getter, None)
+                        if not callable(fn):
+                            continue
+                        try:
+                            obj = fn(session)
+                            if asyncio.iscoroutine(obj):
+                                obj = await obj
+                            if obj is not None:
+                                candidates.append(obj)
+                        except Exception as e:
+                            logger.debug("bot.%s.%s 失败: %s", mgr_name, getter, e)
+                    for dname in ("sessions", "conversations"):
+                        d = getattr(mgr, dname, None)
+                        if isinstance(d, dict) and session in d:
+                            candidates.append(d[session])
+                # llm_mediator 兜底
+                llm = getattr(bot, "llm_mediator", None)
+                if llm is not None:
+                    for getter in ("get_conversation", "get_session"):
+                        fn = getattr(llm, getter, None)
+                        if not callable(fn):
+                            continue
+                        try:
+                            obj = fn(session)
+                            if asyncio.iscoroutine(obj):
+                                obj = await obj
+                            if obj is not None:
+                                candidates.append(obj)
+                        except Exception as e:
+                            logger.debug("llm_mediator.%s 失败: %s", getter, e)
+            # 3) platform_mediator
+            pm = getattr(self.context, "platform_mediator", None)
+            if pm is None and bot is not None:
+                pm = getattr(bot, "platform_mediator", None)
+            if pm is not None:
+                for name in ("get_conversation", "get_session"):
+                    fn = getattr(pm, name, None)
                     if not callable(fn):
                         continue
                     try:
-                        conv = fn(session)
-                        if asyncio.iscoroutine(conv):
-                            conv = await conv
-                        if conv is not None and await self._inject_marker(conv, base):
-                            return True
+                        obj = fn(session)
+                        if asyncio.iscoroutine(obj):
+                            obj = await obj
+                        if obj is not None:
+                            candidates.append(obj)
                     except Exception as e:
-                        logger.debug("通过 %s.%s 获取会话失败: %s", type(mgr).__name__, getter, e)
-                try:
-                    sessions_map = getattr(mgr, "sessions", None)
-                    if isinstance(sessions_map, dict) and session in sessions_map:
-                        if await self._inject_marker(sessions_map[session], base):
-                            return True
-                except Exception as e:
-                    logger.debug("通过 sessions 字典获取会话失败: %s", e)
-            # 3) platform_mediator 兜底
-            pm = getattr(self.context, "platform_mediator", None)
-            if pm is not None:
-                fn = getattr(pm, "get_conversation", None)
-                if callable(fn):
-                    try:
-                        conv = fn(session)
-                        if asyncio.iscoroutine(conv):
-                            conv = await conv
-                        if conv is not None and await self._inject_marker(conv, base):
-                            return True
-                    except Exception as e:
-                        logger.debug("通过 platform_mediator.get_conversation 获取会话失败: %s", e)
-            logger.warning("未能注入打断标记：未找到可用的会话接口 (session=%s)", session)
+                        logger.debug("platform_mediator.%s 失败: %s", name, e)
+            # 去重并逐个尝试注入
+            seen = set()
+            for conv in candidates:
+                key = id(conv)
+                if key in seen:
+                    continue
+                seen.add(key)
+                if await self._inject_marker(conv, base):
+                    return True
+            logger.warning("未能注入打断标记：找到 %d 个候选会话对象，均无法注入 (session=%s)", len(candidates), session)
+            self._log_api_snapshot()
             return False
         except Exception as e:
             logger.error("注入打断标记异常: %s", e, exc_info=True)
             return False
+
+    def _log_api_snapshot(self):
+        """注入失败时打印当前版本可用的 API，便于定位正确的会话接口。"""
+        try:
+            ctx_attrs = [a for a in dir(self.context) if not a.startswith("_")]
+            logger.warning("Context 属性/方法: %s", ctx_attrs)
+        except Exception:
+            pass
+        try:
+            bot = getattr(self.context, "bot", None) or getattr(self.context, "astrbot", None)
+            if bot is not None:
+                bot_attrs = [a for a in dir(bot) if not a.startswith("_")]
+                logger.warning("Bot 属性/方法: %s", bot_attrs)
+        except Exception:
+            pass
 
     async def _inject_marker(self, conv, base) -> bool:
         try:
