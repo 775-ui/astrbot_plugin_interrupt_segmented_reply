@@ -115,7 +115,6 @@ class InterruptSegmentedReplyPlugin(Star):
         if self.get("notify_interrupted", True):
             notice = str(self.get("interrupt_notice", "已打断～"))
             sent = False
-            # 优先用 context.send_message 发送提示（纯发送，不影响本条消息继续进入 LLM 流程）
             try:
                 await self.context.send_message(session, MessageChain([Plain(notice)]))
                 sent = True
@@ -170,8 +169,31 @@ class InterruptSegmentedReplyPlugin(Star):
         base = str(self.get("interrupt_model_mark", "（此条回复被用户打断了，未能完整发送。被打断的部分仍完整保存在上下文中，如需继续请以此为据。）"))
         try:
             candidates = []
-            # 1) context 直接方法
-            for name in ("get_conversation", "get_session", "get_conversation_manager", "get_session_manager"):
+            # 1) v4.27.x：Context 直接暴露 conversation_manager / message_history_manager 属性
+            for mgr in (
+                getattr(self.context, "conversation_manager", None),
+                getattr(self.context, "message_history_manager", None),
+            ):
+                if mgr is None:
+                    continue
+                for getter in ("get_conversation", "get_session", "get_message_history"):
+                    fn = getattr(mgr, getter, None)
+                    if not callable(fn):
+                        continue
+                    try:
+                        obj = fn(session)
+                        if asyncio.iscoroutine(obj):
+                            obj = await obj
+                        if obj is not None:
+                            candidates.append(obj)
+                    except Exception as e:
+                        logger.debug("%s.%s 失败: %s", type(mgr).__name__, getter, e)
+                for dname in ("conversations", "sessions"):
+                    d = getattr(mgr, dname, None)
+                    if isinstance(d, dict) and session in d:
+                        candidates.append(d[session])
+            # 2) context 直接方法（旧式）
+            for name in ("get_conversation", "get_session"):
                 fn = getattr(self.context, name, None)
                 if not callable(fn):
                     continue
@@ -183,14 +205,14 @@ class InterruptSegmentedReplyPlugin(Star):
                         candidates.append(obj)
                 except Exception as e:
                     logger.debug("context.%s 失败: %s", name, e)
-            # 2) bot / astrbot 对象上的各类管理器
+            # 3) bot / astrbot 对象（部分版本）
             bot = getattr(self.context, "bot", None) or getattr(self.context, "astrbot", None)
             if bot is not None:
-                for mgr_name in ("session_manager", "conversation_manager", "message_manager"):
+                for mgr_name in ("session_manager", "conversation_manager", "message_history_manager", "message_manager"):
                     mgr = getattr(bot, mgr_name, None)
                     if mgr is None:
                         continue
-                    for getter in ("get_session", "get_conversation"):
+                    for getter in ("get_conversation", "get_session"):
                         fn = getattr(mgr, getter, None)
                         if not callable(fn):
                             continue
@@ -206,22 +228,7 @@ class InterruptSegmentedReplyPlugin(Star):
                         d = getattr(mgr, dname, None)
                         if isinstance(d, dict) and session in d:
                             candidates.append(d[session])
-                # llm_mediator 兜底
-                llm = getattr(bot, "llm_mediator", None)
-                if llm is not None:
-                    for getter in ("get_conversation", "get_session"):
-                        fn = getattr(llm, getter, None)
-                        if not callable(fn):
-                            continue
-                        try:
-                            obj = fn(session)
-                            if asyncio.iscoroutine(obj):
-                                obj = await obj
-                            if obj is not None:
-                                candidates.append(obj)
-                        except Exception as e:
-                            logger.debug("llm_mediator.%s 失败: %s", getter, e)
-            # 3) platform_mediator
+            # 4) platform_mediator 兜底
             pm = getattr(self.context, "platform_mediator", None)
             if pm is None and bot is not None:
                 pm = getattr(bot, "platform_mediator", None)
@@ -261,6 +268,14 @@ class InterruptSegmentedReplyPlugin(Star):
             logger.warning("Context 属性/方法: %s", ctx_attrs)
         except Exception:
             pass
+        for mgr_name in ("conversation_manager", "message_history_manager"):
+            mgr = getattr(self.context, mgr_name, None)
+            if mgr is not None:
+                try:
+                    logger.warning("%s 属性/方法: %s", mgr_name,
+                                   [a for a in dir(mgr) if not a.startswith("_")])
+                except Exception:
+                    pass
         try:
             bot = getattr(self.context, "bot", None) or getattr(self.context, "astrbot", None)
             if bot is not None:
@@ -331,22 +346,26 @@ class InterruptSegmentedReplyPlugin(Star):
                 return None
         try:
             import time
-            sid = getattr(conv, "session_id", None) or getattr(conv, "id", None) or ""
-            return AstrBotMessage(
-                session_id=sid,
-                sender_id="system",
-                sender_name="AstrBot",
-                message=MessageChain([Plain(base)]),
-                message_str=base,
-                type="message",
-                timestamp=time.time(),
-                self_id=getattr(conv, "self_id", "") or "",
-                unified_msg_origin=sid,
-                platform=getattr(conv, "platform_name", None) or getattr(conv, "platform", "") or "",
-            )
+            sid = getattr(conv, "session_id", None) or getattr(conv, "unified_msg_origin", None) or ""
+            platform = getattr(conv, "platform_name", "") or getattr(conv, "platform", "") or ""
+            attempts = [
+                dict(session_id=sid, sender_id="system", sender_name="AstrBot",
+                     message=MessageChain([Plain(base)]), message_str=base, type="message",
+                     timestamp=time.time(), self_id="", unified_msg_origin=sid, platform=platform),
+                dict(session_id=sid, sender_id="system", sender_name="AstrBot",
+                     message=MessageChain([Plain(base)]), message_str=base, type="message",
+                     timestamp=time.time(), unified_msg_origin=sid),
+                dict(session_id=sid, sender_id="system", sender_name="AstrBot",
+                     message=MessageChain([Plain(base)]), message_str=base),
+            ]
+            for kwargs in attempts:
+                try:
+                    return AstrBotMessage(**kwargs)
+                except Exception as e:
+                    logger.debug("AstrBotMessage 构造尝试失败: %s", e)
         except Exception as e:
             logger.debug("构造 AstrBotMessage 失败: %s", e)
-            return None
+        return None
 
     def remove_empty_brackets(self, text):
         if not self.get("remove_empty_brackets", True):
