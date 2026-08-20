@@ -43,7 +43,7 @@
 打开 AstrBot WebUI → **插件管理** → **安装插件**，输入本仓库地址：
 
 ```
-https://github.com/你的用户名/astrbot_plugin_interrupt_segmented_reply
+https://github.com/你775-ui/astrbot_plugin_interrupt_segmented_reply
 ```
 
 点击安装即可。
@@ -54,7 +54,7 @@ https://github.com/你的用户名/astrbot_plugin_interrupt_segmented_reply
 
 ```bash
 cd /root/AstrBot/data/plugins
-git clone https://github.com/你的用户名/astrbot_plugin_interrupt_segmented_reply.git
+git clone https://github.com/你775-ui/astrbot_plugin_interrupt_segmented_reply.git
 ```
 
 > 🚨 **重要**：安装后请关闭 AstrBot 平台内置的分段回复（`segmented_reply.enable = false`），避免双重分段。
