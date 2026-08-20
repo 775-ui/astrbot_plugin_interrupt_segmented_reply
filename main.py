@@ -23,18 +23,22 @@ class InterruptSegmentedReplyPlugin(Star):
     @filter.on_decorating_result()
     async def on_decorating_result(self, event: AstrMessageEvent) -> None:
         if not self.get("enabled", True):
+            logger.debug("分段回复插件未启用，跳过")
             return
         result = event.get_result()
         if result is None or not result.chain:
+            logger.debug("无回复内容，跳过分段")
             return
         if self.get("only_llm_result", True):
             m = getattr(result, "is_model_result", None)
             if callable(m):
                 try:
                     if not m():
+                        logger.debug("非模型结果，跳过分段")
                         return
                 except Exception:
                     pass
+        threshold = self.get_int("words_count_threshold", 150)
         new_chain = []
         for comp in result.chain:
             if not isinstance(comp, Plain):
@@ -43,7 +47,8 @@ class InterruptSegmentedReplyPlugin(Star):
             text = self.remove_empty_brackets(comp.text)
             if not text:
                 continue
-            if len(text) > self.get_int("words_count_threshold", 150):
+            if len(text) > threshold:
+                logger.debug("单段文本超过阈值(%d>%d)，该段不分段", len(text), threshold)
                 new_chain.append(Plain(text))
                 continue
             for s in self.split(text):
@@ -51,16 +56,18 @@ class InterruptSegmentedReplyPlugin(Star):
                 if s:
                     new_chain.append(Plain(s))
         if len(new_chain) <= 1:
+            logger.debug("分段后仅%d段，无需分段发送", len(new_chain))
             return
         header = [c for c in new_chain if isinstance(c, (Reply, At))]
         rest = [c for c in new_chain if not isinstance(c, (Reply, At))]
         if not rest:
+            logger.debug("无有效文本段，跳过")
             return
         result.chain = [*header, rest[0]]
         pid = uuid4().hex
         self.pending[pid] = {"session": event.unified_msg_origin, "sender": self.sender(event), "comps": rest[1:]}
         event.set_extra(_PENDING, pid)
-        logger.info("分段回复，剩余%d段", len(rest) - 1)
+        logger.info("分段回复：共%d段，剩余%d段待发送 (session=%s)", len(new_chain), len(rest) - 1, event.unified_msg_origin)
 
     @filter.after_message_sent()
     async def after_message_sent(self, event: AstrMessageEvent) -> None:
@@ -69,11 +76,13 @@ class InterruptSegmentedReplyPlugin(Star):
             return
         p = self.pending.pop(pid, None)
         if not p or not p["comps"]:
+            logger.debug("after_message_sent: 无待发送分段 (pid=%s)", pid)
             return
         task = asyncio.create_task(self.send_rest(p["session"], p["sender"], p["comps"]))
         self.tasks[p["session"]] = task
         self.senders[p["session"]] = p["sender"]
         task.add_done_callback(lambda t, s=p["session"]: self.tasks.pop(s, None))
+        logger.info("已创建剩余%d段的发送任务 (session=%s)", len(p["comps"]), p["session"])
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=100)
     async def on_user_message(self, event: AstrMessageEvent) -> None:
@@ -86,14 +95,23 @@ class InterruptSegmentedReplyPlugin(Star):
         if mt and "MESSAGE" not in mt.upper():
             return
         if not getattr(msg_obj, "message", None) and not getattr(event, "message_str", ""):
+            logger.debug("收到空消息，不视为打断 (session=%s)", event.unified_msg_origin)
             return
         session = event.unified_msg_origin
         task = self.tasks.get(session)
-        if task is None or task.done():
+        if task is None:
+            logger.debug("收到用户消息但该会话无发送任务，不打断 (session=%s, msg=%r)",
+                         session, str(getattr(event, "message_str", ""))[:20])
+            return
+        if task.done():
+            logger.debug("收到用户消息但发送任务已完成，不打断 (session=%s)", session)
             return
         if session in self.interrupted:
+            logger.debug("该会话已处于打断状态 (session=%s)", session)
             return
         self.interrupted.add(session)
+        logger.info(">>> 检测到打断！停止继续发送剩余分段 (session=%s, msg=%r)",
+                    session, str(getattr(event, "message_str", ""))[:20])
         if self.get("notify_interrupted", True):
             notice = str(self.get("interrupt_notice", "已打断～"))
             sent = False
@@ -107,9 +125,13 @@ class InterruptSegmentedReplyPlugin(Star):
                     await self.context.send_message(session, MessageChain([Plain(notice)]))
                 except Exception as e:
                     logger.debug("通过 context.send_message 发送打断提示失败: %s", e)
+            logger.info("打断提示已发送: %s", notice)
 
     async def send_rest(self, session, sender, comps):
         truncated = False
+        sent_count = 0
+        total = len(comps)
+        logger.info("开始发送剩余%d段 (session=%s)", total, session)
         try:
             for comp in comps:
                 if session in self.interrupted:
@@ -122,67 +144,79 @@ class InterruptSegmentedReplyPlugin(Star):
                     truncated = True
                     break
                 ok = await self.context.send_message(session, MessageChain([comp]))
+                sent_count += 1
+                logger.info("已发送第%d/%d段 (session=%s)", sent_count, total, session)
                 if not ok:
+                    logger.warning("发送第%d段失败，停止 (session=%s)", sent_count, session)
                     return
         finally:
             self.interrupted.discard(session)
             self.senders.pop(session, None)
-            if truncated and self.get("notify_model", True):
-                await self.inject_interrupt(session)
+            if truncated:
+                logger.info(">>> 分段发送被打断：已发%d段，剩余%d段未发送 (session=%s)",
+                            sent_count, total - sent_count, session)
+                if self.get("notify_model", True):
+                    ok_inject = await self.inject_interrupt(session)
+                    logger.info("注入打断标记结果: %s (session=%s)", ok_inject, session)
 
-    async def inject_interrupt(self, session):
+    async def inject_interrupt(self, session) -> bool:
         base = str(self.get("interrupt_model_mark", "（此条回复被用户打断了，未能完整发送。被打断的部分仍完整保存在上下文中，如需继续请以此为据。）"))
-        # 1) 旧版 API：Context.get_conversation
         try:
-            conv = self.context.get_conversation(session)
-            if conv is not None:
-                if await self._inject_marker(conv, base):
-                    return
-        except Exception as e:
-            logger.debug("Context.get_conversation 不可用: %s", e)
-        # 2) v4：bot.session_manager / bot.conversation_manager / context.session_manager 等
-        bot = getattr(self.context, "bot", None)
-        mgr = None
-        if bot is not None:
-            mgr = getattr(bot, "session_manager", None) or getattr(bot, "conversation_manager", None)
-        if mgr is None:
-            mgr = getattr(self.context, "session_manager", None) or getattr(self.context, "conversation_manager", None)
-        if mgr is not None:
-            for getter in ("get_session", "get_conversation"):
-                fn = getattr(mgr, getter, None)
-                if not callable(fn):
-                    continue
-                try:
-                    conv = fn(session)
-                    if asyncio.iscoroutine(conv):
-                        conv = await conv
-                    if conv is not None and await self._inject_marker(conv, base):
-                        return
-                except Exception as e:
-                    logger.debug("通过 %s.%s 获取会话失败: %s", type(mgr).__name__, getter, e)
+            # 1) 旧版 API：Context.get_conversation
             try:
-                sessions_map = getattr(mgr, "sessions", None)
-                if isinstance(sessions_map, dict) and session in sessions_map:
-                    if await self._inject_marker(sessions_map[session], base):
-                        return
+                conv = self.context.get_conversation(session)
+                if conv is not None:
+                    if await self._inject_marker(conv, base):
+                        return True
             except Exception as e:
-                logger.debug("通过 sessions 字典获取会话失败: %s", e)
-        # 3) platform_mediator 兜底
-        pm = getattr(self.context, "platform_mediator", None)
-        if pm is not None:
-            fn = getattr(pm, "get_conversation", None)
-            if callable(fn):
+                logger.debug("Context.get_conversation 不可用: %s", e)
+            # 2) v4：bot.session_manager / bot.conversation_manager / context.session_manager 等
+            bot = getattr(self.context, "bot", None)
+            mgr = None
+            if bot is not None:
+                mgr = getattr(bot, "session_manager", None) or getattr(bot, "conversation_manager", None)
+            if mgr is None:
+                mgr = getattr(self.context, "session_manager", None) or getattr(self.context, "conversation_manager", None)
+            if mgr is not None:
+                for getter in ("get_session", "get_conversation"):
+                    fn = getattr(mgr, getter, None)
+                    if not callable(fn):
+                        continue
+                    try:
+                        conv = fn(session)
+                        if asyncio.iscoroutine(conv):
+                            conv = await conv
+                        if conv is not None and await self._inject_marker(conv, base):
+                            return True
+                    except Exception as e:
+                        logger.debug("通过 %s.%s 获取会话失败: %s", type(mgr).__name__, getter, e)
                 try:
-                    conv = fn(session)
-                    if asyncio.iscoroutine(conv):
-                        conv = await conv
-                    if conv is not None and await self._inject_marker(conv, base):
-                        return
+                    sessions_map = getattr(mgr, "sessions", None)
+                    if isinstance(sessions_map, dict) and session in sessions_map:
+                        if await self._inject_marker(sessions_map[session], base):
+                            return True
                 except Exception as e:
-                    logger.debug("通过 platform_mediator.get_conversation 获取会话失败: %s", e)
-        logger.warning("未能注入打断标记：当前 AstrBot 版本未找到可用的会话接口 (session=%s)", session)
+                    logger.debug("通过 sessions 字典获取会话失败: %s", e)
+            # 3) platform_mediator 兜底
+            pm = getattr(self.context, "platform_mediator", None)
+            if pm is not None:
+                fn = getattr(pm, "get_conversation", None)
+                if callable(fn):
+                    try:
+                        conv = fn(session)
+                        if asyncio.iscoroutine(conv):
+                            conv = await conv
+                        if conv is not None and await self._inject_marker(conv, base):
+                            return True
+                    except Exception as e:
+                        logger.debug("通过 platform_mediator.get_conversation 获取会话失败: %s", e)
+            logger.warning("未能注入打断标记：未找到可用的会话接口 (session=%s)", session)
+            return False
+        except Exception as e:
+            logger.error("注入打断标记异常: %s", e, exc_info=True)
+            return False
 
-    async def _inject_marker(self, conv, base):
+    async def _inject_marker(self, conv, base) -> bool:
         try:
             # 方式 A：conv.append_message(role, chain)
             am = getattr(conv, "append_message", None)
