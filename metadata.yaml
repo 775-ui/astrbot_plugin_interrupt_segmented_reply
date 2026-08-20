@@ -1,7 +1,7 @@
 name: astrbot_plugin_interrupt_segmented_reply
 display_name: 更好的分段与实时打断
 desc: 复刻优化 AstrBot 原生分段回复，支持用户插话打断、符号过滤、空括号过滤、AI感知打断
-version: v5.1.9
+version: v5.2.1
 author: 775-ui
 repo: https://github.com/775-ui/astrbot_plugin_interrupt_segmented_reply
 astrbot_version: ">=4.16,<5"
