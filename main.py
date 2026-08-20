@@ -1,5 +1,5 @@
 from __future__ import annotations
-import asyncio, math, random, re
+import asyncio, json, math, random, re
 from typing import Any
 from uuid import uuid4
 from astrbot.api import AstrBotConfig, logger
@@ -168,15 +168,31 @@ class InterruptSegmentedReplyPlugin(Star):
     async def inject_interrupt(self, session) -> bool:
         base = str(self.get("interrupt_model_mark", "（此条回复被用户打断了，未能完整发送。被打断的部分仍完整保存在上下文中，如需继续请以此为据。）"))
         try:
+            # ========== v4.27.x 官方 API：Context.conversation_manager ==========
+            conv_mgr = getattr(self.context, "conversation_manager", None)
+            if conv_mgr is not None:
+                try:
+                    cid = conv_mgr.get_curr_conversation_id(session)
+                    if asyncio.iscoroutine(cid):
+                        cid = await cid
+                    if cid:
+                        conv = conv_mgr.get_conversation(session, cid)
+                        if asyncio.iscoroutine(conv):
+                            conv = await conv
+                        if conv is not None:
+                            if await self._append_assistant_marker(conv_mgr, session, cid, conv, base):
+                                return True
+                except Exception as e:
+                    logger.debug("conversation_manager 官方路径失败: %s", e)
+            # ========== 其他版本兜底：通用探测 ==========
             candidates = []
-            # 1) v4.27.x：Context 直接暴露 conversation_manager / message_history_manager 属性
             for mgr in (
                 getattr(self.context, "conversation_manager", None),
                 getattr(self.context, "message_history_manager", None),
             ):
                 if mgr is None:
                     continue
-                for getter in ("get_conversation", "get_session", "get_message_history"):
+                for getter in ("get_conversation", "get_session"):
                     fn = getattr(mgr, getter, None)
                     if not callable(fn):
                         continue
@@ -192,20 +208,6 @@ class InterruptSegmentedReplyPlugin(Star):
                     d = getattr(mgr, dname, None)
                     if isinstance(d, dict) and session in d:
                         candidates.append(d[session])
-            # 2) context 直接方法（旧式）
-            for name in ("get_conversation", "get_session"):
-                fn = getattr(self.context, name, None)
-                if not callable(fn):
-                    continue
-                try:
-                    obj = fn(session)
-                    if asyncio.iscoroutine(obj):
-                        obj = await obj
-                    if obj is not None:
-                        candidates.append(obj)
-                except Exception as e:
-                    logger.debug("context.%s 失败: %s", name, e)
-            # 3) bot / astrbot 对象（部分版本）
             bot = getattr(self.context, "bot", None) or getattr(self.context, "astrbot", None)
             if bot is not None:
                 for mgr_name in ("session_manager", "conversation_manager", "message_history_manager", "message_manager"):
@@ -228,24 +230,6 @@ class InterruptSegmentedReplyPlugin(Star):
                         d = getattr(mgr, dname, None)
                         if isinstance(d, dict) and session in d:
                             candidates.append(d[session])
-            # 4) platform_mediator 兜底
-            pm = getattr(self.context, "platform_mediator", None)
-            if pm is None and bot is not None:
-                pm = getattr(bot, "platform_mediator", None)
-            if pm is not None:
-                for name in ("get_conversation", "get_session"):
-                    fn = getattr(pm, name, None)
-                    if not callable(fn):
-                        continue
-                    try:
-                        obj = fn(session)
-                        if asyncio.iscoroutine(obj):
-                            obj = await obj
-                        if obj is not None:
-                            candidates.append(obj)
-                    except Exception as e:
-                        logger.debug("platform_mediator.%s 失败: %s", name, e)
-            # 去重并逐个尝试注入
             seen = set()
             for conv in candidates:
                 key = id(conv)
@@ -254,15 +238,41 @@ class InterruptSegmentedReplyPlugin(Star):
                 seen.add(key)
                 if await self._inject_marker(conv, base):
                     return True
-            logger.warning("未能注入打断标记：找到 %d 个候选会话对象，均无法注入 (session=%s)", len(candidates), session)
+            logger.warning("未能注入打断标记 (session=%s)", session)
             self._log_api_snapshot()
             return False
         except Exception as e:
             logger.error("注入打断标记异常: %s", e, exc_info=True)
             return False
 
+    async def _append_assistant_marker(self, conv_mgr, session, cid, conv, base) -> bool:
+        """v4.27.x 官方方式：读取对话历史 JSON，追加一条 assistant 记录后写回。"""
+        try:
+            history = []
+            raw = getattr(conv, "history", None)
+            if raw:
+                try:
+                    history = json.loads(raw)
+                except Exception:
+                    history = []
+            if not isinstance(history, list):
+                history = []
+            try:
+                from astrbot.core.agent.message import AssistantMessageSegment, TextPart
+                record = AssistantMessageSegment(content=[TextPart(text=base)]).model_dump()
+            except Exception:
+                record = {"role": "assistant", "content": [{"type": "text", "text": base}]}
+            history.append(record)
+            r = conv_mgr.update_conversation(session, cid, history=history)
+            if asyncio.iscoroutine(r):
+                await r
+            logger.info("已向会话注入打断标记 (update_conversation): %s", session)
+            return True
+        except Exception as e:
+            logger.debug("追加打断标记失败: %s", e, exc_info=True)
+            return False
+
     def _log_api_snapshot(self):
-        """注入失败时打印当前版本可用的 API，便于定位正确的会话接口。"""
         try:
             ctx_attrs = [a for a in dir(self.context) if not a.startswith("_")]
             logger.warning("Context 属性/方法: %s", ctx_attrs)
@@ -276,17 +286,9 @@ class InterruptSegmentedReplyPlugin(Star):
                                    [a for a in dir(mgr) if not a.startswith("_")])
                 except Exception:
                     pass
-        try:
-            bot = getattr(self.context, "bot", None) or getattr(self.context, "astrbot", None)
-            if bot is not None:
-                bot_attrs = [a for a in dir(bot) if not a.startswith("_")]
-                logger.warning("Bot 属性/方法: %s", bot_attrs)
-        except Exception:
-            pass
 
     async def _inject_marker(self, conv, base) -> bool:
         try:
-            # 方式 A：conv.append_message(role, chain)
             am = getattr(conv, "append_message", None)
             if callable(am):
                 try:
@@ -307,7 +309,6 @@ class InterruptSegmentedReplyPlugin(Star):
                         return True
                 except Exception as e:
                     logger.debug("append_message(msg) 失败: %s", e)
-            # 方式 B：conv.update_message 追加到最后一条消息
             msgs = None
             gm = getattr(conv, "get_messages", None)
             if callable(gm):
@@ -342,7 +343,6 @@ class InterruptSegmentedReplyPlugin(Star):
             try:
                 from astrbot.core.astrbot_message import AstrBotMessage
             except Exception:
-                logger.debug("无法导入 AstrBotMessage")
                 return None
         try:
             import time
