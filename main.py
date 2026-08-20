@@ -95,10 +95,18 @@ class InterruptSegmentedReplyPlugin(Star):
             return
         self.interrupted.add(session)
         if self.get("notify_interrupted", True):
+            notice = str(self.get("interrupt_notice", "已打断～"))
+            sent = False
             try:
-                await event.send(event.plain_result(str(self.get("interrupt_notice", "已打断～"))))
-            except Exception:
-                pass
+                await event.send(MessageChain([Plain(notice)]))
+                sent = True
+            except Exception as e:
+                logger.debug("通过 event.send 发送打断提示失败: %s", e)
+            if not sent:
+                try:
+                    await self.context.send_message(session, MessageChain([Plain(notice)]))
+                except Exception as e:
+                    logger.debug("通过 context.send_message 发送打断提示失败: %s", e)
 
     async def send_rest(self, session, sender, comps):
         truncated = False
@@ -123,30 +131,135 @@ class InterruptSegmentedReplyPlugin(Star):
                 await self.inject_interrupt(session)
 
     async def inject_interrupt(self, session):
+        base = str(self.get("interrupt_model_mark", "（此条回复被用户打断了，未能完整发送。被打断的部分仍完整保存在上下文中，如需继续请以此为据。）"))
+        # 1) 旧版 API：Context.get_conversation
         try:
             conv = self.context.get_conversation(session)
-            if conv is None:
-                return
-            msgs = conv.get_messages()
-            if not msgs:
-                return
-            base = str(self.get("interrupt_model_mark", "（此条回复被用户打断了，未能完整发送。被打断的部分仍完整保存在上下文中，如需继续请以此为据。）"))
-            if hasattr(conv, "append_message"):
-                try:
-                    conv.append_message("assistant", MessageChain([Plain(base)]))
-                    logger.info("已向会话上下文注入打断标记: %s", session)
+            if conv is not None:
+                if await self._inject_marker(conv, base):
                     return
-                except Exception as e:
-                    logger.debug("append_message 注入失败，尝试 update_message: %s", e)
-            if hasattr(conv, "update_message") and hasattr(msgs[-1], "chain"):
-                msg_id = getattr(msgs[-1], "id", None) or getattr(msgs[-1], "message_id", None)
-                if msg_id is not None:
-                    old_chain = list(msgs[-1].chain)
-                    old_chain.append(Plain(base))
-                    conv.update_message(msg_id, MessageChain(old_chain), "assistant")
-                    logger.info("已通过 update_message 注入打断标记: %s", session)
         except Exception as e:
-            logger.error("注入打断标记失败: %s", e, exc_info=True)
+            logger.debug("Context.get_conversation 不可用: %s", e)
+        # 2) v4：bot.session_manager / bot.conversation_manager / context.session_manager 等
+        bot = getattr(self.context, "bot", None)
+        mgr = None
+        if bot is not None:
+            mgr = getattr(bot, "session_manager", None) or getattr(bot, "conversation_manager", None)
+        if mgr is None:
+            mgr = getattr(self.context, "session_manager", None) or getattr(self.context, "conversation_manager", None)
+        if mgr is not None:
+            for getter in ("get_session", "get_conversation"):
+                fn = getattr(mgr, getter, None)
+                if not callable(fn):
+                    continue
+                try:
+                    conv = fn(session)
+                    if asyncio.iscoroutine(conv):
+                        conv = await conv
+                    if conv is not None and await self._inject_marker(conv, base):
+                        return
+                except Exception as e:
+                    logger.debug("通过 %s.%s 获取会话失败: %s", type(mgr).__name__, getter, e)
+            try:
+                sessions_map = getattr(mgr, "sessions", None)
+                if isinstance(sessions_map, dict) and session in sessions_map:
+                    if await self._inject_marker(sessions_map[session], base):
+                        return
+            except Exception as e:
+                logger.debug("通过 sessions 字典获取会话失败: %s", e)
+        # 3) platform_mediator 兜底
+        pm = getattr(self.context, "platform_mediator", None)
+        if pm is not None:
+            fn = getattr(pm, "get_conversation", None)
+            if callable(fn):
+                try:
+                    conv = fn(session)
+                    if asyncio.iscoroutine(conv):
+                        conv = await conv
+                    if conv is not None and await self._inject_marker(conv, base):
+                        return
+                except Exception as e:
+                    logger.debug("通过 platform_mediator.get_conversation 获取会话失败: %s", e)
+        logger.warning("未能注入打断标记：当前 AstrBot 版本未找到可用的会话接口 (session=%s)", session)
+
+    async def _inject_marker(self, conv, base):
+        try:
+            # 方式 A：conv.append_message(role, chain)
+            am = getattr(conv, "append_message", None)
+            if callable(am):
+                try:
+                    r = am("assistant", MessageChain([Plain(base)]))
+                    if asyncio.iscoroutine(r):
+                        await r
+                    logger.info("已向会话注入打断标记 (append_message): %s", getattr(conv, "session_id", ""))
+                    return True
+                except Exception as e:
+                    logger.debug("append_message(role, chain) 失败，尝试其他方式: %s", e)
+                try:
+                    msg = self._make_bot_message(conv, base)
+                    if msg is not None:
+                        r = am(msg)
+                        if asyncio.iscoroutine(r):
+                            await r
+                        logger.info("已向会话注入打断标记 (append_message msg): %s", getattr(conv, "session_id", ""))
+                        return True
+                except Exception as e:
+                    logger.debug("append_message(msg) 失败: %s", e)
+            # 方式 B：conv.update_message 追加到最后一条消息
+            msgs = None
+            gm = getattr(conv, "get_messages", None)
+            if callable(gm):
+                try:
+                    msgs = gm()
+                    if asyncio.iscoroutine(msgs):
+                        msgs = await msgs
+                except Exception:
+                    msgs = None
+            if msgs is None:
+                msgs = getattr(conv, "messages", None)
+            if msgs:
+                last = msgs[-1]
+                msg_id = getattr(last, "id", None) or getattr(last, "message_id", None)
+                um = getattr(conv, "update_message", None)
+                if msg_id is not None and callable(um):
+                    old_chain = list(getattr(last, "chain", []) or [])
+                    old_chain.append(Plain(base))
+                    r = um(msg_id, MessageChain(old_chain), "assistant")
+                    if asyncio.iscoroutine(r):
+                        await r
+                    logger.info("已向会话注入打断标记 (update_message): %s", getattr(conv, "session_id", ""))
+                    return True
+        except Exception as e:
+            logger.debug("注入打断标记失败: %s", e, exc_info=True)
+        return False
+
+    def _make_bot_message(self, conv, base):
+        try:
+            from astrbot.core.platform.astrbot_message import AstrBotMessage
+        except Exception:
+            try:
+                from astrbot.core.astrbot_message import AstrBotMessage
+            except Exception:
+                logger.debug("无法导入 AstrBotMessage")
+                return None
+        try:
+            import time
+            sid = getattr(conv, "session_id", None) or getattr(conv, "id", None) or ""
+            return AstrBotMessage(
+                session_id=sid,
+                sender_id="system",
+                sender_name="AstrBot",
+                message=MessageChain([Plain(base)]),
+                message_str=base,
+                type="message",
+                timestamp=time.time(),
+                self_id=getattr(conv, "self_id", "") or "",
+                unified_msg_origin=sid,
+                platform=getattr(conv, "platform_name", None) or getattr(conv, "platform", "") or "",
+            )
+        except Exception as e:
+            logger.debug("构造 AstrBotMessage 失败: %s", e)
+            return None
 
     def remove_empty_brackets(self, text):
         if not self.get("remove_empty_brackets", True):
